@@ -24,6 +24,14 @@
   {% if notice %}
   <div class="notice notice-{{ notice_level }}">{{ notice }}</div>
   {% endif %}
+  {% if pending_prune %}
+  <div class="notice notice-warning">
+    旧版本副本清理未完成：版本
+    {% for seq in pending_prune %}#{{ seq }}{{ "、" if not loop.last }}{% endfor %}
+    的副本文件仍占用磁盘（副本只保留最近 10 个版本）。未删除的副本不会被记为已释放，
+    将在下次上传或服务重启后自动重试清理。
+  </div>
+  {% endif %}
 
   <section class="card">
     <h2>当前对象</h2>

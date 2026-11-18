@@ -14,6 +14,7 @@ from typing import Any, Iterator, Sequence
 MAX_OBJECT_BYTES = 1024 * 1024
 REPLICA_SLOTS = (1, 2, 3)
 RETAINED_VERSION_REPLICAS = 10
+PRUNED_REPLICA_NOTE = "历史版本副本已按保留策略清理"
 _HASH_CHUNK = 256 * 1024
 
 
@@ -89,6 +90,24 @@ class ReplicaCheck:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class PruneReport:
+    """一次旧版本副本清理的结果。
+
+    failures 逐条记录删除失败原因；pending_versions 是清理结束后磁盘上
+    仍留有副本文件的超保留期版本序号。两者皆空才算彻底完成。
+    """
+
+    removed_files: int
+    freed_versions: tuple[int, ...]
+    failures: tuple[str, ...]
+    pending_versions: tuple[int, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures and not self.pending_versions
 
 
 @dataclass(frozen=True)
@@ -190,6 +209,15 @@ class ObjectStorage:
 
         self._cleanup_temporaries()
         self._remove_orphan_replica_files()
+        prune_report = self.prune_old_versions()
+        if not prune_report.ok:
+            pending = "、".join(f"#{seq}" for seq in prune_report.pending_versions)
+            self._log_standalone(
+                "warning",
+                "prune",
+                f"服务启动：旧版本副本清理重试后仍有残留（版本 {pending}）。"
+                "未删除的文件不会被记为已释放，将在后续上传或重启时继续重试。",
+            )
         self.reconcile_current(reason="服务启动")
         self._log_standalone(
             "info", "startup", "服务启动：已核对当前对象和三个副本的实际可读状态。"
@@ -591,55 +619,160 @@ class ObjectStorage:
                 f"当前对象切换为版本 #{version.seq}{old}。",
                 version_id=version.id,
             )
-            self._prune_old_versions()
             return version
 
-    def _prune_old_versions(self) -> None:
-        """只保留最近若干版本的副本文件，避免磁盘无限增长。
+    def prune_old_versions(self) -> PruneReport:
+        """清理超出保留窗口（最近 RETAINED_VERSION_REPLICAS 个版本）的副本文件。
 
-        版本登记与巡检历史保留；被裁掉副本的旧版本下载会返回 409（无有效副本）。
+        每次调用都按当前登记重新计算待清理集合，因此清理失败后再次上传或服务
+        重启都会按“最新的最近 10 版”重试，不会误删仍在保留窗口内的版本。
+        单个文件删除失败不影响其它版本；只有确认文件已不存在才把对应副本登记
+        为已清理，残留文件不会被报成已释放。本方法不因删除失败抛错，结果通过
+        PruneReport 返回。版本登记与巡检历史始终保留。
         """
         with self._write_lock:
             with self._db() as conn:
                 rows = conn.execute(
                     """
-                    SELECT id, seq FROM versions
-                    ORDER BY seq DESC LIMIT -1 OFFSET ?
+                    SELECT v.id AS version_id, v.seq AS seq, r.slot AS slot,
+                           r.relative_path AS relative_path, r.note AS note
+                      FROM versions v
+                      JOIN replicas r ON r.version_id = v.id
+                     WHERE v.id IN (
+                         SELECT id FROM versions
+                         ORDER BY seq DESC LIMIT -1 OFFSET ?
+                     )
+                     ORDER BY v.seq, r.slot
                     """,
                     (RETAINED_VERSION_REPLICAS,),
                 ).fetchall()
-                removed = 0
-                for row in rows:
-                    paths = conn.execute(
-                        "SELECT relative_path FROM replicas WHERE version_id = ?",
-                        (row["id"],),
-                    ).fetchall()
-                    for path_row in paths:
-                        try:
-                            path = self._abs_path(path_row["relative_path"])
-                        except StorageError:
-                            continue
-                        if path.exists():
-                            path.unlink(missing_ok=True)
-                            removed += 1
-                    conn.execute(
-                        """
-                        UPDATE replicas
-                           SET last_checked_at = ?, last_check_state = 'missing',
-                               observed_digest = NULL, observed_size = NULL,
-                               note = '历史版本副本已按保留策略清理'
-                         WHERE version_id = ?
-                        """,
-                        (utc_now(), row["id"]),
-                    )
-                if removed:
-                    self._log(
-                        conn,
-                        "info",
-                        "prune",
-                        f"已清理版本 #{rows[-1]['seq']} 及更早版本的 {removed} 个副本文件"
-                        f"（保留最近 {RETAINED_VERSION_REPLICAS} 个版本）。",
-                    )
+
+            by_version: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                entry = by_version.setdefault(
+                    row["version_id"], {"seq": row["seq"], "replicas": []}
+                )
+                entry["replicas"].append(row)
+
+            removed = 0
+            freed: list[int] = []
+            failures: list[str] = []
+            now = utc_now()
+            for version_id, entry in by_version.items():
+                seq = entry["seq"]
+                replicas = entry["replicas"]
+                if all(r["note"] == PRUNED_REPLICA_NOTE for r in replicas):
+                    continue  # 此前已彻底清理，跳过以免重复记日志
+                deleted = 0
+                cleared_slots: list[int] = []
+                version_failures: list[str] = []
+                for replica in replicas:
+                    slot = replica["slot"]
+                    try:
+                        path = self._abs_path(replica["relative_path"])
+                    except StorageError as exc:
+                        version_failures.append(f"副本 {slot} 路径无效（{exc}）")
+                        continue
+                    try:
+                        path.unlink()
+                        deleted += 1
+                        cleared_slots.append(slot)
+                    except FileNotFoundError:
+                        # 文件本就不存在：只需把登记补齐为已清理。
+                        if replica["note"] != PRUNED_REPLICA_NOTE:
+                            cleared_slots.append(slot)
+                    except OSError as exc:
+                        reason = exc.strerror or str(exc)
+                        version_failures.append(f"副本 {slot} 删除失败（{reason}）")
+                if cleared_slots:
+                    with self._db() as conn:
+                        for slot in cleared_slots:
+                            conn.execute(
+                                """
+                                UPDATE replicas
+                                   SET last_checked_at = ?, last_check_state = 'missing',
+                                       observed_digest = NULL, observed_size = NULL,
+                                       note = ?
+                                 WHERE version_id = ? AND slot = ?
+                                """,
+                                (now, PRUNED_REPLICA_NOTE, version_id, slot),
+                            )
+                        if not version_failures:
+                            if deleted:
+                                message = (
+                                    f"已清理版本 #{seq} 的 {deleted} 个副本文件"
+                                    f"（保留最近 {RETAINED_VERSION_REPLICAS} 个版本）。"
+                                )
+                            else:
+                                message = (
+                                    f"版本 #{seq} 的副本文件此前已不存在，"
+                                    "登记已核对为已清理。"
+                                )
+                            self._log(conn, "info", "prune", message)
+                        else:
+                            self._log(
+                                conn,
+                                "warning",
+                                "prune",
+                                f"版本 #{seq} 的副本仅部分清理："
+                                f"{'；'.join(version_failures)}。残留文件仍登记在案，"
+                                "将在下次上传或服务重启后重试。",
+                            )
+                elif version_failures:
+                    with self._db() as conn:
+                        self._log(
+                            conn,
+                            "warning",
+                            "prune",
+                            f"版本 #{seq} 的副本清理未完成："
+                            f"{'；'.join(version_failures)}。残留文件仍登记在案，"
+                            "将在下次上传或服务重启后重试。",
+                        )
+                if not version_failures:
+                    freed.append(seq)
+                removed += deleted
+                failures.extend(
+                    f"版本 #{seq} {message}" for message in version_failures
+                )
+
+            pending = tuple(self._pending_prune_seqs())
+            return PruneReport(removed, tuple(freed), tuple(failures), pending)
+
+    def _pending_prune_seqs(self) -> list[int]:
+        """超保留窗口且磁盘上仍留有副本文件的版本序号（按磁盘实际判断）。"""
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT v.seq AS seq, r.relative_path AS relative_path
+                  FROM versions v
+                  JOIN replicas r ON r.version_id = v.id
+                 WHERE v.id IN (
+                     SELECT id FROM versions
+                     ORDER BY seq DESC LIMIT -1 OFFSET ?
+                 )
+                 ORDER BY v.seq
+                """,
+                (RETAINED_VERSION_REPLICAS,),
+            ).fetchall()
+        pending: list[int] = []
+        seen: set[int] = set()
+        for row in rows:
+            seq = int(row["seq"])
+            if seq in seen:
+                continue
+            try:
+                exists = self._abs_path(row["relative_path"]).exists()
+            except (StorageError, OSError):
+                exists = True  # 无法确认已释放时按未释放处理
+            if exists:
+                seen.add(seq)
+                pending.append(seq)
+        return pending
+
+    def pending_prune_versions(self) -> list[int]:
+        """仍留有副本文件、等待清理重试的超保留期版本序号。"""
+        with self._write_lock:
+            return self._pending_prune_seqs()
 
     def corrupt_replica(
         self, slot: int, expected_version_id: str | None = None

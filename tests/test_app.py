@@ -442,3 +442,220 @@ def test_repair_ignores_corrupt_source(app_env):
     status = client.get("/api/status").json()
     assert status["readable"] == 3
     assert client.get("/download").content == payload
+
+
+def block_unlink(monkeypatch, version_id: str, slot: int):
+    """让指定版本指定副本文件的删除失败，模拟清退最旧版本时的故障。"""
+    real_unlink = Path.unlink
+    target_name = f"v-{version_id}.bin"
+    target_parent = f"replica-{slot}"
+
+    def guarded(self, missing_ok=False):
+        if self.name == target_name and self.parent.name == target_parent:
+            raise OSError("simulated prune failure")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", guarded)
+
+
+def upload_n(client, n: int, start: int = 1) -> dict[int, bytes]:
+    payloads = {}
+    for i in range(start, start + n):
+        data = f"v{i}".encode()
+        payloads[i] = data
+        upload(client, data)
+    return payloads
+
+
+def test_prune_failure_still_reports_upload_success(app_env, monkeypatch):
+    """第 11 次上传清退最旧版本失败：不得误报上传失败，残留不得报成已释放。"""
+    from app.storage import PRUNED_REPLICA_NOTE, RETAINED_VERSION_REPLICAS
+
+    client, storage = app_env
+    upload_n(client, RETAINED_VERSION_REPLICAS)
+    first = storage.list_versions(20)[-1]
+    assert first.seq == 1
+
+    block_unlink(monkeypatch, first.id, slot=2)
+    new_payload = b"v11"
+    response = upload(client, new_payload)
+    location = unquote(response.headers["location"])
+    assert "level=warning" in location
+    assert "已登记版本 #11" in location
+    assert "清理未完成" in location
+    assert "未改变当前对象" not in location
+
+    # 新版本已登记且可下载。
+    current = storage.current_version()
+    assert current.seq == RETAINED_VERSION_REPLICAS + 1
+    assert client.get("/download").content == new_payload
+
+    # 删除失败的副本仍在磁盘上，且没有被登记成已清理；其余副本如实登记。
+    stuck = replica_path(storage, 2, first.id)
+    assert stuck.exists()
+    rows = storage.replica_rows(first.id)
+    assert rows[2]["note"] != PRUNED_REPLICA_NOTE
+    assert rows[1]["note"] == PRUNED_REPLICA_NOTE
+    assert rows[3]["note"] == PRUNED_REPLICA_NOTE
+
+    # 操作日志只有清理警告，没有把版本 #1 报成已释放的成功记录。
+    events = storage.recent_events(30)
+    prune_info = [
+        e for e in events if e["kind"] == "prune" and e["level"] == "info"
+    ]
+    assert any(
+        e["kind"] == "prune" and e["level"] == "warning" for e in events
+    )
+    assert not any(f"#{first.seq} " in e["message"] for e in prune_info)
+
+    # 首页持续提示清理未完成（刷新后仍可见）。
+    page = client.get("/").text
+    assert "清理未完成" in page
+    assert f"#{first.seq}" in page
+
+    # 残留副本仍属登记版本：旧版本按所报版本号下载时只能交付真实字节。
+    download = client.get(f"/download?version_id={first.id}")
+    assert download.status_code == 200
+    assert download.content == b"v1"
+
+
+def test_prune_resumes_after_restart(app_env, monkeypatch):
+    """清理失败后在重启时接续重试；障碍消除后重试成功。"""
+    from app.storage import RETAINED_VERSION_REPLICAS
+
+    client, storage = app_env
+    upload_n(client, RETAINED_VERSION_REPLICAS)
+    first = storage.list_versions(20)[-1]
+
+    block_unlink(monkeypatch, first.id, slot=2)
+    upload(client, b"v11")
+    stuck = replica_path(storage, 2, first.id)
+    assert stuck.exists()
+    assert storage.pending_prune_versions() == [first.seq]
+
+    # 重启（删除障碍仍在）：启动时重试清理，仍失败，仍如实挂起。
+    restarted = ObjectStorage(storage.data_dir)
+    restarted.init()
+    assert stuck.exists()
+    assert restarted.pending_prune_versions() == [first.seq]
+    events = restarted.recent_events(30)
+    assert any(
+        e["kind"] == "prune" and e["level"] == "warning" for e in events
+    )
+
+    # 再次重启（障碍已消除）：接续清理成功，残留文件被释放。
+    monkeypatch.undo()
+    recovered = ObjectStorage(storage.data_dir)
+    recovered.init()
+    assert not stuck.exists()
+    assert recovered.pending_prune_versions() == []
+    rows = recovered.replica_rows(first.id)
+    assert all(row["note"] == "历史版本副本已按保留策略清理" for row in rows.values())
+
+    # 旧版本副本已真正释放：下载拒绝；当前版本不受影响。
+    assert client.get(f"/download?version_id={first.id}").status_code == 409
+    assert client.get("/download").content == b"v11"
+    # 挂起横幅已消失（历史日志中的清理警告记录仍保留，属正常）。
+    assert "仍占用磁盘" not in client.get("/").text
+
+
+def test_prune_recomputes_retention_window(app_env, monkeypatch):
+    """清理未完成期间再上传：按最新的最近 10 版重算待删集合，不误删保留版本。"""
+    from app.storage import RETAINED_VERSION_REPLICAS
+
+    client, storage = app_env
+    upload_n(client, RETAINED_VERSION_REPLICAS)
+    versions = {v.seq: v for v in storage.list_versions(20)}
+    first, second, third = versions[1], versions[2], versions[3]
+
+    # 第 11 次上传：v1 副本 2 删除失败，v1 残留。
+    block_unlink(monkeypatch, first.id, slot=2)
+    upload(client, b"v11")
+    assert replica_path(storage, 2, first.id).exists()
+
+    # 清理未完成期间上传第 12 版：重算后 v1、v2 都超出最新保留窗口。
+    monkeypatch.undo()
+    response = upload(client, b"v12")
+    location = unquote(response.headers["location"])
+    assert "level=success" in location
+    assert "清理未完成" not in location
+
+    # v1、v2 的副本全部释放；v3 起仍在保留窗口内，不得误删。
+    for slot in (1, 2, 3):
+        assert not replica_path(storage, slot, first.id).exists()
+        assert not replica_path(storage, slot, second.id).exists()
+        assert replica_path(storage, slot, third.id).exists()
+    assert client.get(f"/download?version_id={first.id}").status_code == 409
+    assert client.get(f"/download?version_id={second.id}").status_code == 409
+    assert client.get(f"/download?version_id={third.id}").content == b"v3"
+    assert storage.pending_prune_versions() == []
+    assert client.get("/download").content == b"v12"
+
+
+def test_failed_upload_keeps_current_version(app_env, monkeypatch):
+    """登记前失败（副本写入异常）：保持原当前版可下载，不产生新版本。"""
+    client, storage = app_env
+    upload(client, b"stable-v1")
+    first = storage.current_version()
+
+    def failing_write(destination, data):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(
+        ObjectStorage, "_atomic_write", staticmethod(failing_write)
+    )
+    response = upload(client, b"should-not-register")
+    location = unquote(response.headers["location"])
+    assert "level=error" in location
+    assert "未改变当前对象" in location
+
+    assert storage.current_version().id == first.id
+    assert len(storage.list_versions(10)) == 1
+    assert client.get("/download").content == b"stable-v1"
+
+
+def test_prune_exception_still_reports_upload_success(app_env, monkeypatch):
+    """清理任务自身异常（如数据库故障）也不得误报为上传失败。"""
+    client, storage = app_env
+
+    def broken_prune():
+        raise RuntimeError("simulated prune crash")
+
+    monkeypatch.setattr(ObjectStorage, "prune_old_versions", broken_prune)
+    response = upload(client, b"prune-crash")
+    location = unquote(response.headers["location"])
+    assert "level=warning" in location
+    assert "已登记版本 #1" in location
+    assert "清理未完成" in location
+    assert "未改变当前对象" not in location
+    assert client.get("/download").content == b"prune-crash"
+
+
+def test_prune_report_counts_and_idempotent(tmp_path: Path):
+    """清理报告如实计数；重复调用幂等，不重复记日志。"""
+    from app.storage import RETAINED_VERSION_REPLICAS
+
+    storage = ObjectStorage(tmp_path / "data")
+    storage.init()
+    for i in range(RETAINED_VERSION_REPLICAS + 2):
+        storage.create_version(f"v{i}".encode(), f"f{i}.bin")
+
+    report = storage.prune_old_versions()
+    assert report.ok
+    assert report.removed_files == 6  # v1、v2 各 3 个副本
+    assert report.freed_versions == (1, 2)
+    assert report.failures == ()
+    assert storage.pending_prune_versions() == []
+    prune_logs = [
+        e for e in storage.recent_events(50) if e["kind"] == "prune"
+    ]
+    assert len(prune_logs) == 2
+
+    again = storage.prune_old_versions()
+    assert again.ok
+    assert again.removed_files == 0
+    assert again.freed_versions == ()
+    prune_logs_after = [
+        e for e in storage.recent_events(50) if e["kind"] == "prune"
+    ]
+    assert len(prune_logs_after) == 2  # 没有重复记日志

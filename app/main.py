@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import threading
@@ -30,6 +31,7 @@ from .storage import (
 
 BASE_DIR = Path(__file__).resolve().parent
 MAX_REQUEST_BODY = MAX_OBJECT_BYTES + 512 * 1024
+logger = logging.getLogger(__name__)
 REPLICA_STATE_LABELS = {
     "verified": "已验真",
     "corrupt": "损坏",
@@ -168,6 +170,7 @@ def create_app(
             "inspections": storage.recent_inspections(10),
             "versions": storage.list_versions(10),
             "events": storage.recent_events(25),
+            "pending_prune": storage.pending_prune_versions(),
             "notice": notice,
             "notice_level": level,
             "max_bytes": MAX_OBJECT_BYTES,
@@ -199,6 +202,12 @@ def create_app(
             data = b"".join(chunks)
             filename = getattr(upload_file, "filename", "") or ""
             version = await run_in_threadpool(storage.create_version, data, filename)
+            # 登记成功后才清理旧版本副本；清理失败不得误报为上传失败。
+            try:
+                prune = await run_in_threadpool(storage.prune_old_versions)
+            except Exception:  # noqa: BLE001 - 清理异常不影响已登记的新版本
+                logger.exception("旧版本副本清理执行异常")
+                prune = None
         except InvalidUpload as exc:
             return _redirect_notice(str(exc), "error")
         except StorageError as exc:
@@ -214,7 +223,19 @@ def create_app(
             f"已登记版本 #{version.seq}，SHA-256 {version.digest}，"
             "三个副本均写入并验真。"
         )
-        return _redirect_notice(message, "success")
+        if prune is not None and prune.ok:
+            return _redirect_notice(message, "success")
+        if prune is None:
+            detail = "清理任务执行异常，原因见操作日志"
+        else:
+            detail = "；".join(prune.failures[:3])
+            if len(prune.failures) > 3:
+                detail += f" 等共 {len(prune.failures)} 项"
+        message += (
+            f"旧版本副本清理未完成：{detail}。残留副本仍登记在案、"
+            "不会被记为已释放，将在下次上传或服务重启后自动重试清理。"
+        )
+        return _redirect_notice(message, "warning")
 
     @app.post("/replicas/{slot}/corrupt")
     async def corrupt(slot: int, request: Request):
